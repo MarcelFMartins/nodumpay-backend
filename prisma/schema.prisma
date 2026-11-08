@@ -1,0 +1,119 @@
+// =============================================================
+// Nodum Pay — hub de pagamentos
+// -------------------------------------------------------------
+//  - Dinheiro sempre em centavos (Int).
+//  - `Event` guarda cada aviso do Mercado Pago (para reprocessar).
+//  - `Payment` é uma linha por pagamento do MP (chave única no id do MP).
+//  - `Delivery` é cada aviso que o hub manda para um app, com retry.
+// =============================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  // Postgres do Dokploy (mesma VPS): conexão direta, sem pooler.
+  url      = env("DATABASE_URL")
+}
+
+enum DeliveryStatus {
+  PENDING
+  DELIVERED
+  FAILED
+}
+
+/// Um sistema ligado ao hub (Studio, Barber, ...).
+model App {
+  id            String   @id @default(cuid())
+  /// Prefixo do external_reference: "studio" => "studio:<id>".
+  slug          String   @unique
+  name          String
+  /// Para onde o hub manda os avisos de pagamento.
+  webhookUrl    String
+  /// Segredo que assina os avisos enviados ao app (HMAC-SHA256).
+  signingSecret String
+  /// Hash (sha256) da chave que o app usa para chamar POST /api/charges.
+  apiKeyHash    String   @unique
+  /// Recebe referências antigas, sem prefixo. Só um app deve ter isto ligado.
+  legacyMatch   Boolean  @default(false)
+  active        Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  payments   Payment[]
+  deliveries Delivery[]
+  charges    Charge[]
+}
+
+/// Cada notificação válida recebida do Mercado Pago, na íntegra.
+model Event {
+  id           String    @id @default(cuid())
+  mpType       String
+  mpResourceId String
+  requestId    String?
+  rawBody      Json
+  receivedAt   DateTime  @default(now())
+  processedAt  DateTime?
+  error        String?
+
+  @@index([mpResourceId])
+  @@index([receivedAt])
+}
+
+model Payment {
+  id            String    @id @default(cuid())
+  mpPaymentId   String    @unique
+  /// Null = pagamento que o hub não soube atribuir a nenhum app.
+  appId         String?
+  app           App?      @relation(fields: [appId], references: [id])
+  /// Referência já sem o prefixo (ex.: o id da barbearia).
+  reference     String?
+  /// external_reference como veio do MP.
+  rawReference  String?
+  status        String
+  amountCents   Int
+  method        String?
+  preapprovalId String?
+  approvedAt    DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([appId, status])
+  @@index([createdAt])
+}
+
+model Delivery {
+  id             String         @id @default(cuid())
+  appId          String
+  app            App            @relation(fields: [appId], references: [id])
+  eventType      String
+  /// "<evento>:<id do recurso no MP>" — impede avisar duas vezes o mesmo fato.
+  dedupeKey      String         @unique
+  payload        Json
+  status         DeliveryStatus @default(PENDING)
+  attempts       Int            @default(0)
+  nextAttemptAt  DateTime       @default(now())
+  lastStatusCode Int?
+  lastError      String?
+  deliveredAt    DateTime?
+  createdAt      DateTime       @default(now())
+
+  @@index([status, nextAttemptAt])
+  @@index([appId, createdAt])
+}
+
+/// Cobranças criadas pelos apps via POST /api/charges.
+model Charge {
+  id           String   @id @default(cuid())
+  appId        String
+  app          App      @relation(fields: [appId], references: [id])
+  reference    String
+  preferenceId String   @unique
+  title        String
+  amountCents  Int
+  checkoutUrl  String
+  createdAt    DateTime @default(now())
+
+  @@index([appId, createdAt])
+}
