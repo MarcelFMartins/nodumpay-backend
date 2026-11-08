@@ -32,6 +32,37 @@ const res = await fetch(`${process.env.NODUM_PAY_URL}/api/charges`, {
 const { checkoutUrl, preferenceId } = await res.json();
 ```
 
+## 1b. Assinatura recorrente (cartão)
+
+O cliente cadastra o cartão uma vez e o Mercado Pago cobra sozinho a cada `frequencyMonths` meses. Cada cobrança chega ao app como `payment.approved` / `payment.failed`, com o mesmo `reference` e o `preapprovalId`.
+
+```ts
+const auth = { Authorization: `Bearer ${process.env.NODUM_PAY_API_KEY}`, "Content-Type": "application/json" };
+
+// Criar → devolve o link para o cliente cadastrar o cartão
+const res = await fetch(`${process.env.NODUM_PAY_URL}/api/subscriptions`, {
+  method: "POST",
+  headers: auth,
+  body: JSON.stringify({
+    reference: barbershopId,          // o hub grava "barber:<barbershopId>"
+    reason: "Nodum Barber — assinatura mensal",
+    amountCents: 4990,
+    payerEmail: "dono@exemplo.com",
+    frequencyMonths: 1,               // 1, 3, 6 ou 12
+    backUrl: "https://barber.nodumsolucoes.com/assinatura?retorno=1", // opcional (HTTPS)
+  }),
+});
+const { preapprovalId, checkoutUrl } = await res.json(); // 201
+
+// Consultar → { preapprovalId, status, reference, checkoutUrl, payerEmail, nextPaymentDate, amountCents, frequencyMonths }
+await fetch(`${process.env.NODUM_PAY_URL}/api/subscriptions/${preapprovalId}`, { headers: auth });
+
+// Cancelar (idempotente)
+await fetch(`${process.env.NODUM_PAY_URL}/api/subscriptions/${preapprovalId}/cancel`, { method: "POST", headers: auth });
+```
+
+O app só enxerga as próprias assinaturas: as com o seu prefixo e, se ele for o app "legado", as antigas sem prefixo. Qualquer outra responde **404**. Se o Mercado Pago recusar, a resposta é 422 (dados) ou 502 (MP fora do ar), com `{ error }`.
+
 ## 2. Receber o aviso
 
 O hub faz `POST` na URL cadastrada, com este corpo:

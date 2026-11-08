@@ -22,6 +22,7 @@ vi.mock("next/server", async (original) => {
 const MP_SECRET = "mp-webhook-secret";
 const ADMIN_TOKEN = "admin-token-de-teste-com-mais-de-32-caracteres";
 const mpPayments: Record<string, object> = {};
+const mpPreapprovals: Record<string, Record<string, unknown>> = {};
 const received: { headers: http.IncomingHttpHeaders; body: string }[] = [];
 let appStatus = 200;
 let mpServer: http.Server;
@@ -62,6 +63,7 @@ describe.skipIf(!DB)("fluxo do hub (Postgres real)", () => {
   let prisma: typeof import("@/lib/prisma").prisma;
   let signingSecret = "";
   let apiKey = "";
+  let barberKey = "";
 
   beforeAll(async () => {
     process.env.DATABASE_URL = DB;
@@ -70,17 +72,32 @@ describe.skipIf(!DB)("fluxo do hub (Postgres real)", () => {
     execSync("npx prisma migrate deploy", { stdio: "pipe", env: process.env });
 
     mpServer = await listen((req, res) => {
-      const match = req.url?.match(/\/v1\/payments\/(\d+)/);
-      if (req.method === "POST" && req.url === "/checkout/preferences") {
+      let raw = "";
+      req.on("data", (c) => (raw += c));
+      req.on("end", () => {
         res.setHeader("content-type", "application/json");
-        res.end(JSON.stringify({ id: "pref-1", init_point: "https://mp.test/checkout/pref-1" }));
-      } else if (match && mpPayments[match[1]]) {
-        res.setHeader("content-type", "application/json");
-        res.end(JSON.stringify(mpPayments[match[1]]));
-      } else {
-        res.statusCode = 404;
-        res.end("{}");
-      }
+        const match = req.url?.match(/\/v1\/payments\/(\d+)/);
+        const pre = req.url?.match(/^\/preapproval\/([^/?]+)/);
+        if (req.method === "POST" && req.url === "/checkout/preferences") {
+          res.end(JSON.stringify({ id: "pref-1", init_point: "https://mp.test/checkout/pref-1" }));
+        } else if (req.method === "POST" && req.url === "/preapproval") {
+          const body = JSON.parse(raw);
+          const id = `pre-${Object.keys(mpPreapprovals).length + 1}`;
+          mpPreapprovals[id] = {
+            id, status: "pending", external_reference: body.external_reference, payer_email: body.payer_email,
+            init_point: `https://mp.test/subscriptions/${id}`, auto_recurring: body.auto_recurring,
+          };
+          res.end(JSON.stringify(mpPreapprovals[id]));
+        } else if (pre && mpPreapprovals[pre[1]]) {
+          if (req.method === "PUT") Object.assign(mpPreapprovals[pre[1]], JSON.parse(raw));
+          res.end(JSON.stringify(mpPreapprovals[pre[1]]));
+        } else if (match && mpPayments[match[1]]) {
+          res.end(JSON.stringify(mpPayments[match[1]]));
+        } else {
+          res.statusCode = 404;
+          res.end("{}");
+        }
+      });
     });
     appServer = await listen((req, res) => {
       let body = "";
@@ -108,6 +125,7 @@ describe.skipIf(!DB)("fluxo do hub (Postgres real)", () => {
       data: { slug: "studio", name: "Studio", webhookUrl: appUrl, apiKeyHash: creds.apiKeyHash, signingSecret, legacyMatch: true },
     });
     const barber = generateCredentials();
+    barberKey = barber.apiKey;
     await prisma.app.create({
       data: { slug: "barber", name: "Barber", webhookUrl: appUrl, apiKeyHash: barber.apiKeyHash, signingSecret: barber.signingSecret },
     });
@@ -238,6 +256,78 @@ describe.skipIf(!DB)("fluxo do hub (Postgres real)", () => {
       });
     expect((await get("1001", apiKey)).status).toBe(200);
     expect((await get("1002", apiKey)).status).toBe(404); // é do barber
+  });
+
+
+  describe("assinaturas recorrentes (/api/subscriptions)", () => {
+    const headers = (key: string) => ({ authorization: `Bearer ${key}`, "content-type": "application/json" });
+
+    it("cria com o prefixo do app, consulta e cancela só a própria", async () => {
+      const { POST } = await import("@/app/api/subscriptions/route");
+      const create = (key: string | null, body: object) =>
+        POST(new Request("http://hub/api/subscriptions", { method: "POST", headers: key ? headers(key) : {}, body: JSON.stringify(body) }));
+      const body = { reference: "shop-9", reason: "Mensal", amountCents: 9990, payerEmail: "a@b.com", frequencyMonths: 3 };
+
+      expect((await create(null, body)).status).toBe(401);
+      expect((await create(barberKey, { ...body, amountCents: -1 })).status).toBe(400);
+
+      const res = await create(barberKey, body);
+      expect(res.status).toBe(201);
+      const sub = await res.json();
+      expect(sub).toMatchObject({ status: "pending", reference: "shop-9", amountCents: 9990, frequencyMonths: 3 });
+      expect(sub.checkoutUrl).toContain(sub.preapprovalId);
+      expect(mpPreapprovals[sub.preapprovalId].external_reference).toBe("barber:shop-9");
+
+      const one = await import("@/app/api/subscriptions/[id]/route");
+      const get = (key: string) =>
+        one.GET(new Request(`http://hub/api/subscriptions/${sub.preapprovalId}`, { headers: headers(key) }), {
+          params: Promise.resolve({ id: sub.preapprovalId }),
+        });
+      expect((await get(barberKey)).status).toBe(200);
+      // O Studio é o app legado, mas a assinatura tem prefixo do Barber: não é dele.
+      expect((await get(apiKey)).status).toBe(404);
+
+      const cancel = await import("@/app/api/subscriptions/[id]/cancel/route");
+      const doCancel = (key: string) =>
+        cancel.POST(new Request(`http://hub/api/subscriptions/${sub.preapprovalId}/cancel`, { method: "POST", headers: headers(key) }), {
+          params: Promise.resolve({ id: sub.preapprovalId }),
+        });
+      expect((await doCancel(apiKey)).status).toBe(404);
+      const cancelled = await doCancel(barberKey);
+      expect(cancelled.status).toBe(200);
+      expect((await cancelled.json()).status).toBe("cancelled");
+      expect((await doCancel(barberKey)).status).toBe(200); // idempotente
+      expect((await one.GET(new Request("http://hub/x", { headers: headers(barberKey) }), { params: Promise.resolve({ id: "nao-existe" }) })).status).toBe(404);
+    });
+
+    it("assinatura antiga sem prefixo pertence ao app legado", async () => {
+      mpPreapprovals["old-1"] = { id: "old-1", status: "authorized", external_reference: "shop-antiga" };
+      const one = await import("@/app/api/subscriptions/[id]/route");
+      const get = (key: string) =>
+        one.GET(new Request("http://hub/api/subscriptions/old-1", { headers: headers(key) }), { params: Promise.resolve({ id: "old-1" }) });
+      const studio = await prisma.app.findUniqueOrThrow({ where: { slug: "studio" } });
+      await prisma.app.update({ where: { id: studio.id }, data: { legacyMatch: true } });
+      expect((await get(apiKey)).status).toBe(200);
+      expect((await get(barberKey)).status).toBe(404);
+    });
+
+    it("cobrança recorrente avisa o app com a referência da assinatura", async () => {
+      const id = Object.keys(mpPreapprovals).find((k) => mpPreapprovals[k].external_reference === "barber:shop-9")!;
+      mpPayments["5001"] = {
+        id: 5001, status: "approved", transaction_amount: 99.9, payment_method_id: "visa",
+        preapproval_id: id, date_approved: new Date().toISOString(),
+      };
+      expect((await webhook("5001")).status).toBe(200);
+      const last = JSON.parse(received.at(-1)!.body);
+      expect(last).toMatchObject({ event: "payment.approved", app: "barber", reference: "shop-9", preapprovalId: id, amountCents: 9990 });
+    });
+
+    it("assinatura cancelada no MP vira subscription.cancelled para o app", async () => {
+      const id = Object.keys(mpPreapprovals).find((k) => mpPreapprovals[k].external_reference === "barber:shop-9")!;
+      expect((await webhook(id, "subscription_preapproval")).status).toBe(200);
+      const last = JSON.parse(received.at(-1)!.body);
+      expect(last).toMatchObject({ event: "subscription.cancelled", app: "barber", reference: "shop-9", preapprovalId: id });
+    });
   });
 
   describe("API do painel (/api/admin)", () => {

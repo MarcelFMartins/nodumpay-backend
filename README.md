@@ -29,6 +29,9 @@ Next.js 15 (só rotas de API) · Prisma 6 · PostgreSQL 17 · Docker (Dokploy).
 | `POST /api/webhooks/mercadopago` | Mercado Pago | Confere `x-signature`, grava o aviso, consulta o pagamento na API do MP, cria a entrega e responde |
 | `POST /api/charges` | Apps (`Bearer <apiKey>`) | Cria a cobrança no MP com o prefixo do app; devolve `checkoutUrl` |
 | `GET /api/payments/:id` | Apps (`Bearer <apiKey>`) | Consulta um pagamento do próprio app |
+| `POST /api/subscriptions` | Apps (`Bearer <apiKey>`) | Cria assinatura recorrente no cartão (preapproval) com o prefixo do app; devolve `checkoutUrl` |
+| `GET /api/subscriptions/:id` | Apps (`Bearer <apiKey>`) | Consulta uma assinatura do próprio app |
+| `POST /api/subscriptions/:id/cancel` | Apps (`Bearer <apiKey>`) | Cancela a renovação automática |
 | `GET /api/health` | Monitor de uptime / Docker | 200 se o banco responde |
 | `GET /api/cron/deliveries` | Agendador externo, opcional (`Bearer $CRON_SECRET`) | Reenvia entregas pendentes |
 | `GET /api/admin/overview` | Painel (`Bearer $ADMIN_API_TOKEN`) | KPIs do mês, série de 30 dias, saúde, erros recentes |

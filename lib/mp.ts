@@ -16,7 +16,7 @@ export function isMercadoPagoConfigured(): boolean {
 
 async function call<T>(
   path: string,
-  init: { method: "GET" | "POST"; body?: unknown; idempotencyKey?: string }
+  init: { method: "GET" | "POST" | "PUT"; body?: unknown; idempotencyKey?: string }
 ): Promise<T> {
   const token = process.env.MP_ACCESS_TOKEN;
   if (!token) throw new MercadoPagoError("MP_ACCESS_TOKEN não configurado");
@@ -79,10 +79,55 @@ export interface PreapprovalResponse {
   id: string;
   status: "pending" | "authorized" | "paused" | "cancelled";
   external_reference?: string;
+  init_point?: string;
+  payer_email?: string;
+  reason?: string;
+  next_payment_date?: string | null;
+  auto_recurring?: { frequency?: number; frequency_type?: string; transaction_amount?: number };
 }
 
 export function getPreapproval(id: string): Promise<PreapprovalResponse> {
-  return call<PreapprovalResponse>(`/preapproval/${id}`, { method: "GET" });
+  return call<PreapprovalResponse>(`/preapproval/${encodeURIComponent(id)}`, { method: "GET" });
+}
+
+/**
+ * Assinatura no cartão: o cliente abre `init_point`, cadastra o cartão e o
+ * Mercado Pago passa a cobrar sozinho a cada `frequencyMonths` meses. Os
+ * pagamentos gerados chegam ao webhook do hub (o da aplicação no MP).
+ */
+export function createPreapproval(params: {
+  reason: string;
+  payerEmail: string;
+  amountBRL: number;
+  frequencyMonths: number;
+  externalReference: string;
+  backUrl?: string;
+  idempotencyKey: string;
+}): Promise<PreapprovalResponse> {
+  return call<PreapprovalResponse>("/preapproval", {
+    method: "POST",
+    idempotencyKey: params.idempotencyKey,
+    body: {
+      reason: params.reason,
+      external_reference: params.externalReference,
+      payer_email: params.payerEmail,
+      ...(isPublicHttps(params.backUrl) ? { back_url: params.backUrl } : {}),
+      auto_recurring: {
+        frequency: params.frequencyMonths,
+        frequency_type: "months",
+        transaction_amount: params.amountBRL,
+        currency_id: "BRL",
+      },
+      status: "pending",
+    },
+  });
+}
+
+export function cancelPreapproval(id: string): Promise<PreapprovalResponse> {
+  return call<PreapprovalResponse>(`/preapproval/${encodeURIComponent(id)}`, {
+    method: "PUT",
+    body: { status: "cancelled" },
+  });
 }
 
 // --------------------------- Cobrança (checkout) ---------------
